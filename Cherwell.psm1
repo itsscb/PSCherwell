@@ -1,4 +1,4 @@
-﻿Class Cherwell {
+Class Cherwell {
     hidden [string]$Server
     [ValidateSet("Internal", "Windows")]
     hidden [string]$Authentication
@@ -126,7 +126,7 @@ Please submit a Server (FQDN)
         }
         $this.Credential = Get-Credential
         $this.URI = "https://$($Selection)/CherwellAPI"
-        $this.APIKEY = "f4cdf151-57ef-4fda-bc58-431c4ee46aa0"
+        $this.APIKEY = $env:Cherwell_Client_ID
     }
     
     [void] Login() {
@@ -141,7 +141,8 @@ Please submit a Server (FQDN)
         if ($this.Authentication -eq "Windows") {
             
             $requestBody.Add("username", "$($this.Credential.GetNetworkCredential().Domain)\$($this.Credential.GetNetworkCredential().UserName)")
-        } else {
+        }
+        else {
             $requestBody.Add("username", $this.Credential.GetNetworkCredential().UserName)
         }
         $requestBody.Add("password", $this.Credential.GetNetworkCredential().Password)
@@ -159,6 +160,7 @@ Please submit a Server (FQDN)
             $response.access_token,
             $response.expires_in
         )
+        $this.GetBusinessObjects()
     }
 
     [bool] hidden VerifyToken() {
@@ -251,7 +253,7 @@ Please submit a Server (FQDN)
         $this.CurrentBusinessObject.Relationships = $Relationships
     }
 
-    [BusinessObjectRecord] hidden GetBusinessObjectTemplate() {
+    [BusinessObjectRecord] GetBusinessObjectTemplate() {
         if (-not $this.VerifyToken()) {
             $this.RefreshToken()
         }
@@ -308,7 +310,7 @@ Please submit a Server (FQDN)
         }
         $this.CurrentBusinessObject = $this.BusinessObjects | Where-Object { $_.DisplayName -eq $DisplayName }
         $this.GetCurrentRelationships()
-        $this.GetBusinessObjectTemplate()
+        #$this.GetBusinessObjectTemplate()
     } 
     
     [BusinessObjectRecord[]] GetRecordBySearch(
@@ -496,16 +498,27 @@ Please submit a Server (FQDN)
         $this.CurrentRecord = $this.GetRecordByRecordID($this.CurrentRecord.RecordID)
     }
 
-    [void] LinkChild(
-        [BusinessObjectRecord]$ChildRecord
+    [void] UnlinkChild(
+        [BusinessObjectRecord]$ChildRecord,
+        [string]$RelationshipID
     ) {
-        $RelationshipID = $null
-        foreach ($rel in $this.CurrentRecord.BusinessObject.Relationships) {
-            if ($rel.TargetBusinessObjectID -eq $ChildRecord.BusinessObjectID) {
-                $RelationshipID = $rel.RelationshipID
-            }
+        if (-not $RelationshipID) {
+            throw "No Relationship found. Parent: $($this.CurrentRecord.BusinessObject.DisplayName), Record: $($this.CurrentRecord.PublicID), Child: $($ChildRecord.BusinessObject.DisplayName), ChildRecord: $($ChildRecord.PublicID)"
         }
 
+        $this.CurrentRecord.UnlinkChildByRecordID(
+            $this.RequestHeader,
+            $this.URI,
+            $RelationshipID,
+            $ChildRecord.BusinessObjectID,
+            $ChildRecord.RecordID
+        )
+    }
+
+    [void] LinkChild(
+        [BusinessObjectRecord]$ChildRecord,
+        [string]$RelationshipID
+    ) {
         if (-not $RelationshipID) {
             throw "No Relationship found. Parent: $($this.CurrentRecord.BusinessObject.DisplayName), Record: $($this.CurrentRecord.PublicID), Child: $($ChildRecord.BusinessObject.DisplayName), ChildRecord: $($ChildRecord.PublicID)"
         }
@@ -520,16 +533,10 @@ Please submit a Server (FQDN)
     }
 
     [void] LinkChildByIDs(
+        [string]$RelationshipID,
         [string]$ChildBusinessObjectID,
         [string]$ChildRecordID
     ) {
-        $RelationshipID = $null
-        foreach ($rel in $this.CurrentRecord.BusinessObject.Relationships) {
-            if ($rel.TargetBusinessObjectID -eq $ChildBusinessObjectID) {
-                $RelationshipID = $rel.RelationshipID
-            }
-        }
-
         if (-not $RelationshipID) {
             throw "No Relationship found. Parent: $($this.CurrentRecord.BusinessObjectID), Record: $($this.CurrentRecord.RecordID), Child: $($ChildBusinessObjectID), ChildRecord: $($ChildRecordID)"
         }
@@ -571,13 +578,33 @@ Please submit a Server (FQDN)
         return $Record
     }
 
+    [void] NewSearchByBusinessObjectDisplayName(
+        [string]$DisplayName
+    ) {
+        if (-not $this.BusinessObjects) {
+            throw "No BusinessObjects in cache. Please use GetBusinessObjects prior using this Method."
+        }
+
+        [BusinessObject]$BusinessObject = $null
+
+        foreach($b in $this.BusinessObjects) {
+            if ($b.DisplayName -eq $DisplayName) {
+                $BusinessObject = $b
+            }
+        }
+
+        $this.CurrentSearch = [Search]::new($BusinessObject)
+        $this.CurrentSearch.GetBusinessObjectTemplate($this.URI, $this.RequestHeader)
+    }
+
     [void] NewSearch() {
         if (-not $this.CurrentBusinessObject) {
             throw "No BusinessObject selected. Please use SelectBusinessObjectByDisplayName prior using this Method."
         }
         $this.CurrentSearch = [Search]::new($this.CurrentBusinessObject)
+        $this.CurrentSearch.GetBusinessObjectTemplate($this.URI, $this.RequestHeader)
     }
-
+    
     [void] NewSearch(
         [SearchFilter[]]$SearchFilters
     ) {
@@ -585,8 +612,79 @@ Please submit a Server (FQDN)
             throw "No BusinessObject selected. Please use SelectBusinessObjectByDisplayName prior using this Method."
         }
         $this.CurrentSearch = [Search]::new($this.CurrentBusinessObject, $SearchFilters)
+        $this.CurrentSearch.GetBusinessObjectTemplate($this.URI, $this.RequestHeader)
     }
 
+    [void] GetSearchResults() {
+        if (-not $this.CurrentSearch) {
+            $this.NewSearch()
+        }
+        if (-not $this.CurrentSearch.BusinessObject) {
+            $this.CurrentSearch.BusinessObject = $this.CurrentBusinessObject
+        }
+        if (-not $this.VerifyToken()) {
+            $this.RefreshToken()
+        }
+        [BusinessObjectRecord[]]$Records = $null
+
+        $requestURI = "$($this.URI)/api/V1/getsearchresults"
+        
+        $PageNumber = 1
+        $Collected = 0
+        $TotalRows = 0
+        $response = $null
+        do {
+            Write-Host "`r$(" "*60)" -NoNewline
+            Write-Host "`rCurrent Page: $($PageNumber) Collected: $($Collected) of $($TotalRows)" -NoNewline
+            $requestBody = $this.CurrentSearch.GetRequestBody($false, $PageNumber, $this.CurrentSearch.PageSize) | ConvertTo-Json
+            $requestBody = [System.Text.Encoding]::UTF8.GetBytes($requestBody)
+    
+            $response = Invoke-RestMethod -Method Post -Headers $this.RequestHeader -Uri $requestURI -Body $requestBody -ContentType application/json
+            $TotalRows = $response.totalRows
+            $Collected += $response.businessObjects.Count
+            $PageNumber++
+            
+            foreach ($r in $response.businessObjects) {
+                [Field[]]$Fields = @()
+                foreach ($f in $r.fields) {
+                    $Fields += [Field]::new(
+                        $f.displayName,
+                        $f.name,
+                        $f.fieldId,
+                        $f.fullFieldId,
+                        $f.value,
+                        $f.dirty,
+                        $false 
+                    )
+                    
+                }
+
+                [Link[]]$Links = @()
+                foreach ($l in $r.links) {
+                    $Links += [Link]::new(
+                        $l.name,
+                        $l.url
+                    )
+                }
+    
+                $Record = [BusinessObjectRecord]::new(
+                    $this.CurrentBusinessObject,
+                    $r.busObId,
+                    $r.busObRecId,
+                    $r.busObPublicId,
+                    $Fields,
+                    $Links
+                )
+
+                $Records += $Record
+            }
+        } while ($Collected -lt $TotalRows)
+        Write-Host "`r$(" "*60)" -NoNewline
+        Write-Host "`rCollected $($Collected) of $($TotalRows) Datasets" -NoNewline
+        Write-Host ""
+
+        $this.SearchResults = $Records
+    }
     [void] GetSearchResults(
         [bool]$IncludeAllFields
     ) {
@@ -612,7 +710,8 @@ Please submit a Server (FQDN)
             Write-Host "`r$(" "*60)" -NoNewline
             Write-Host "`rCurrent Page: $($PageNumber) Collected: $($Collected) of $($TotalRows)" -NoNewline
             $requestBody = $this.CurrentSearch.GetRequestBody($IncludeAllFields, $PageNumber, $PageSize) | ConvertTo-Json
-    
+            $requestBody = [System.Text.Encoding]::UTF8.GetBytes($requestBody)
+
             $response = Invoke-RestMethod -Method Post -Headers $this.RequestHeader -Uri $requestURI -Body $requestBody -ContentType application/json
             $TotalRows = $response.totalRows
             $Collected += $response.businessObjects.Count
@@ -668,14 +767,11 @@ Please submit a Server (FQDN)
         if ("eq", "gt", "lt", "contains", "startswith" -notcontains $Operator) {
             throw "Invalid Operator. Please use 'eq', 'gt', 'lt', 'contains' or 'startswith'"
         }
-        if (-not $this.CurrentRecord) {
-            throw "No Record to save. Please use one of the Methods GetRecordByRecordID, GetRecordByPublicID, GetRecordBySearch or GetBusinessObjectTemplate to grab a Record and modify it with the Method UpdateFieldByDisplayName prior Saving."
-        }
         if (-not $this.CurrentSearch) {
             $this.NewSearch()
         }
         
-        $this.CurrentSearch.AddSearchFilterByField($this.CurrentRecord.GetFieldByDisplayName($DisplayName), $Operator, $Value)
+        $this.CurrentSearch.AddSearchFilterByField($this.CurrentSearch.BusinessObjectTemplate.GetFieldByDisplayName($DisplayName), $Operator, $Value)
     }
 }
 
@@ -725,6 +821,34 @@ Class BusinessObject {
         $this.Group = $Group
         $this.Lookup = $Lookup
         $this.Supporting = $Supporting
+    }
+
+    [Relationship[]] ShowRelationshipsToByBusinessObject(
+        [BusinessObject]$TargetBusinessObject
+    ) {
+        [Relationship[]]$TempRelationships = @()
+
+        foreach($rel in $this.Relationships) {
+            if ($rel.TargetBusinessObjectID -eq $TargetBusinessObject.BusinessObjectID) {
+                $TempRelationships += $rel
+            }
+        }
+
+        return $TempRelationships
+    }
+
+    [Relationship[]] ShowRelationshipsToByBusinessObjectID(
+        [string]$TargetBusinessObjectID
+    ) {
+        [Relationship[]]$TempRelationships = @()
+
+        foreach($rel in $this.Relationships) {
+            if ($rel.TargetBusinessObjectID -eq $TargetBusinessObjectID) {
+                $TempRelationships += $rel
+            }
+        }
+
+        return $TempRelationships
     }
 }
 
@@ -812,7 +936,8 @@ Class BusinessObjectRecord {
             }
             if ($f.Required) {
                 $DisplayName = "$($f.DisplayName) (Required)"
-            } else {
+            }
+            else {
                 $DisplayName = "$($f.DisplayName)"
             }
             Add-Member -InputObject $output -MemberType NoteProperty -Name $DisplayName -Value "$($f.Value)"
@@ -830,7 +955,8 @@ Class BusinessObjectRecord {
         foreach ($f in $this.Fields | Sort-Object -Property Required, DisplayName) {
             if ($f.Required) {
                 $DisplayName = "$($f.DisplayName) (Required)"
-            } else {
+            }
+            else {
                 $DisplayName = "$($f.DisplayName)"
             }
             Add-Member -InputObject $output -MemberType NoteProperty -Name $DisplayName -Value "$($f.Value)"
@@ -885,6 +1011,18 @@ Class BusinessObjectRecord {
         $requestURI = "$($URI)/api/V1/linkrelatedbusinessobject/parentbusobid/$($this.BusinessObjectID)/parentbusobrecid/$($this.RecordID)/relationshipid/$($RelationshipID)/busobid/$($ChildBusinessObjectID)/busobrecid/$($ChildRecordID)"
         
         $response = Invoke-RestMethod -Method GET -Headers $RequestHeader -Uri $requestURI 
+        Write-Host ($response | ConvertTo-Json)
+    }
+    [void] UnlinkChildByRecordID(
+        [hashtable]$RequestHeader,
+        [string]$URI,
+        [string]$RelationshipID,
+        [string]$ChildBusinessObjectID,
+        [string]$ChildRecordID
+    ) {
+        $requestURI = "$($URI)/api/V1/unlinkrelatedbusinessobject/parentbusobid/$($this.BusinessObjectID)/parentbusobrecid/$($this.RecordID)/relationshipid/$($RelationshipID)/busobid/$($ChildBusinessObjectID)/busobrecid/$($ChildRecordID)"
+        
+        $response = Invoke-RestMethod -Method Delete -Headers $RequestHeader -Uri $requestURI 
         Write-Host ($response | ConvertTo-Json)
     }
 }
@@ -964,20 +1102,69 @@ Class SearchFilter {
 
 Class Search {
     [BusinessObject]$BusinessObject
+    [BusinessObjectRecord]$BusinessObjectTemplate
     [SearchFilter[]]$SearchFilters
+    [int]$Pagesize=200
     
     Search(
         [BusinessObject]$BusinessObject,
+        [BusinessObjectRecord]$BusinessObjectTemplate,
         [SearchFilter[]]$SearchFilters
     ) {
         $this.BusinessObject = $BusinessObject
+        $this.BusinessObjectTemplate = $BusinessObjectTemplate
         $this.SearchFilters = $SearchFilters
+    }
+
+    Search(
+        [BusinessObject]$BusinessObject,
+        [BusinessObjectRecord]$BusinessObjectTemplate
+    ) {
+        $this.BusinessObject = $BusinessObject
+        $this.BusinessObjectTemplate = $BusinessObjectTemplate
     }
 
     Search(
         [BusinessObject]$BusinessObject
     ) {
         $this.BusinessObject = $BusinessObject
+    }
+
+    [void] GetBusinessObjectTemplate(
+        [string] $URI,
+        [hashtable] $RequestHeader
+    ) {
+        
+        [BusinessObjectRecord]$Template = [BusinessObjectRecord]::new(
+            $this.BusinessObject,
+            $this.BusinessObject.BusinessObjectID
+        )
+
+        $requestURI = "$($URI)/api/V1/getbusinessobjecttemplate"
+
+        $requestBody = @{
+            "busObId"    = $this.BusinessObject.BusinessObjectID
+            "includeAll" = $true
+        }
+
+        $response = Invoke-RestMethod -Method Post -Headers $RequestHeader -Uri $requestURI -Body $requestBody
+        
+        [Field[]]$Fields = @()
+
+        foreach ($f in $response.fields) {
+            $Fields += [Field]::new(
+                $f.displayName,
+                $f.name,
+                $f.fieldId,
+                $f.fullFieldId,
+                $f.value,
+                $f.dirty,
+                $false
+            )
+        }
+
+        $Template.Fields = $Fields
+        $this.BusinessObjectTemplate = $Template
     }
 
     [hashtable] GetRequestBody(
@@ -1040,7 +1227,71 @@ Class Search {
 }
 
 function New-CherwellConnection() {
-    [CmdletBinding()]
+    <#
+    .SYNOPSIS
+        Returns an Cherwell-Object with which you can interact with the Cherwell-API
+    .DESCRIPTION
+        This module enables you to interact with the API of Cherwell - Batteries included.
+    .EXAMPLE
+        $cw = New-CherwellConnection -Server cherwellserver.yourdomain -Authentication "Windows"
+
+        Returns an Cherwell-Object connected to the Server "cherwellserver.yourdomain" after requesting the Credentials of the Windows-User
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+
+        Sets the Parameter CurrentBusinessObject to "Desktop-Computer"
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+        $cw.GetRecordBySearch("COMPUTER01")
+        $cw.CurrentRecord.Print()
+
+        Prints the filled Fields of the Record "COMPUTER01"
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+        $cw.GetRecordBySearch("COMPUTER01")
+        $cw.CurrentRecord.PrintAll()
+
+        Prints all Fields of the Record "COMPUTER01"
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+        $cw.GetRecordBySearch("COMPUTER01")
+
+        Sets the Parameter CurrentRecord to the first Result of a QuickSearch for "COMPUTER01"
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+        $cw.GetRecordBySearch("COMPUTER01")
+        $cw.NewSearchByBusinessObjectDisplayName("Kontakt")
+        $cw.AddSearchFilterByFieldDisplayName("SamAccountName","EQ","USER01")
+        $cw.GetSearchResults()
+        $cw.LinkChild($cw.SearchResults[0],"$($RelationshipID)")
+
+        Links the current Record "COMPUTER01" to the first Searchresult for "USER01" with the RelationshipID in the Variable $RelationshipID
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+        $cw.GetRecordBySearch("COMPUTER01")
+        $cw.CurrentRecord.UpdateFieldByDisplayName("Bezeichnung","COMPUTER02")
+        $cw.SaveRecord()
+
+        Renames the Field "Bezeichnung" of the Record "COMPUTER01" to "COMPUTER02".
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+        $cw.GetBusinessObjectTemplate()
+        $cw.CurrentRecord.UpdateFieldByDisplayName("Bezeichnung","COMPUTER03") #Repeat for all required Fields
+        $cw.SaveRecord()
+
+        Creates a new Record.
+    .EXAMPLE
+        $cw.SelectBusinessObjectByDisplayName("Desktop-Computer")
+        $cw.NewSearch()
+        $cw.AddSearchFilterByFieldDisplayName("Bezeichnung","EQ","COMPUTER01")
+        $cw.GetSearchResults($true)
+
+        Sets the Parameter SearchResults to the Results of a Search with the Filter "Bezeichnung EQ COMPUTER01". The Parameter $true in $cw.GetSearchResults($true) grabs all Fields of the Records - no Parameter or $false would not grab those Fields.
+    #>
+    
+    [CmdletBinding(
+        SupportsShouldProcess = $true
+    )]
     param (
         [Parameter(
             Mandatory = $true
@@ -1065,27 +1316,35 @@ function New-CherwellConnection() {
         $Credential
     )
 
-    if (($Server) -and (-not $Authentication) -and (-not $Credential) -and (-not $APIKEY)) {
-        $Connection = [cherwell]::new($Server)
+    if ($PSCmdlet.ShouldProcess($Server, "Creating an Instance of the Class Cherwell and Connecting with Authentication-Method '$($Authentication)'$(if ($Credential) {" as '$($Credential.GetNetworkCredential().Domain)\$($Credential.GetNetworkCredential().UserName)'" })")) {
+
+        if (($Server) -and (-not $Authentication) -and (-not $Credential) -and (-not $APIKEY)) {
+            $Connection = [cherwell]::new($Server)
+        }
+        elseif (($Server) -and ($Authentication) -and (-not $Credential) -and (-not $APIKEY)) {
+            $Connection = [cherwell]::new($Server, $Authentication)
+        }
+        elseif (($Server) -and ($Authentication) -and (-not $Credential) -and ($APIKEY)) {
+            $Connection = [cherwell]::new($Server, $Authentication, $APIKEY)
+        }
+        elseif (($Server) -and ($Authentication) -and ($Credential) -and (-not $APIKEY)) {
+            $Connection = [cherwell]::new($Server, $Authentication, $Credential)
+        }
+        elseif (($Server) -and ($Authentication) -and ($Credential) -and ($APIKEY)) {
+            $Connection = [cherwell]::new($Server, $Authentication, $APIKEY, $Credential)
+        }
+        else {
+            $Connection = [cherwell]::new()
+        }
+        
+        $Connection.Login()
+        return $Connection
     }
-    elseif (($Server) -and ($Authentication) -and (-not $Credential) -and (-not $APIKEY)) {
-        $Connection = [cherwell]::new($Server, $Authentication)
-    }
-    elseif (($Server) -and ($Authentication) -and (-not $Credential) -and ($APIKEY)) {
-        $Connection = [cherwell]::new($Server, $Authentication, $APIKEY)
-    }
-    elseif (($Server) -and ($Authentication) -and ($Credential) -and (-not $APIKEY)) {
-        $Connection = [cherwell]::new($Server, $Authentication, $Credential)
-    }
-    elseif (($Server) -and ($Authentication) -and ($Credential) -and ($APIKEY)) {
-        $Connection = [cherwell]::new($Server, $Authentication, $APIKEY,$Credential)
-    }
-    else {
-        $Connection = [cherwell]::new()
-    }
-    
-    $Connection.Login()
-    return $Connection
+
+}
+
+if (-not $env:Cherwell_Client_ID) {
+    Write-Warning "Environment Variable 'Cherwell_Client_ID' not found. Either set the Environment Variable with the Cherwell-Client_ID or pass it as an Argument to 'New-CherwellConnection'."
 }
 
 Export-ModuleMember *
